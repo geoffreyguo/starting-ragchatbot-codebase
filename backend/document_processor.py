@@ -1,75 +1,144 @@
+"""
+文档处理模块
+
+解析课程文档，提取结构化信息并生成文本片段用于向量存储。
+
+核心功能：
+- 读取课程文档（支持 UTF-8 编码）
+- 解析课程元数据（标题、链接、讲师）
+- 识别课时结构（Lesson N: Title 格式）
+- 智能分块处理（基于句子边界，带重叠）
+- 生成 Course 和 CourseChunk 对象
+
+文档格式要求：
+    Course Title: [课程标题]
+    Course Link: [课程链接]
+    Course Instructor: [讲师姓名]
+
+    Lesson 0: [课时标题]
+    Lesson Link: [课时链接]
+    [课时内容...]
+
+    Lesson 1: [课时标题]
+    ...
+"""
+
 import os
 import re
 from typing import List, Tuple
+import logging
 from models import Course, Lesson, CourseChunk
 
+logger = logging.getLogger(__name__)
+
+
 class DocumentProcessor:
-    """Processes course documents and extracts structured information"""
-    
+    """
+    文档处理器
+
+    将原始课程文档转换为结构化数据和可搜索的文本片段。
+
+    属性：
+        chunk_size: 每个文本块的最大字符数
+        chunk_overlap: 相邻块之间的重叠字符数
+    """
+
     def __init__(self, chunk_size: int, chunk_overlap: int):
+        """初始化处理器，设置分块参数"""
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-    
+        logger.debug(f"DocumentProcessor initialized: chunk_size={chunk_size}, overlap={chunk_overlap}")
+
     def read_file(self, file_path: str) -> str:
-        """Read content from file with UTF-8 encoding"""
+        """
+        读取文档文件
+
+        使用 UTF-8 编码读取文件内容，失败时使用容错模式。
+
+        Args:
+            file_path: 文档文件路径
+
+        Returns:
+            文件内容字符串
+        """
+        logger.debug(f"Reading file: {file_path}")
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read()
+                content = file.read()
+                logger.debug(f"File read: {len(content)} characters")
+                return content
         except UnicodeDecodeError:
-            # If UTF-8 fails, try with error handling
+            # UTF-8 解码失败时，忽略无法解码的字符
+            logger.warning(f"UTF-8 decode error, using fallback")
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-                return file.read()
-    
-
+                content = file.read()
+                logger.debug(f"File read with fallback: {len(content)} characters")
+                return content
 
     def chunk_text(self, text: str) -> List[str]:
-        """Split text into sentence-based chunks with overlap using config settings"""
-        
-        # Clean up the text
-        text = re.sub(r'\s+', ' ', text.strip())  # Normalize whitespace
-        
-        # Better sentence splitting that handles abbreviations
-        # This regex looks for periods followed by whitespace and capital letters
-        # but ignores common abbreviations
-        sentence_endings = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\!|\?)\s+(?=[A-Z])')
+        """
+        文本分块处理
+
+        按句子边界分割文本，生成带重叠的文本块。
+        重叠设计确保上下文连贯，提高搜索质量。
+
+        Args:
+            text: 待分块的文本
+
+        Returns:
+            文本块列表
+
+        分块策略：
+        1. 按句子分割（识别句号、问号、感叹号后的换行）
+        2. 组合句子直到达到 chunk_size
+        3. 下一块从当前块末尾 overlap 字符处开始
+        """
+        logger.debug(f"Chunking text: {len(text)} characters")
+
+        # 清理文本，标准化空白字符
+        text = re.sub(r'\s+', ' ', text.strip())
+
+        # 按句子分割（处理缩写词等特殊情况）
+        # 正则表达式：识别句号/问号/感叹号后跟随大写字母的位置
+        sentence_endings = re.compile(
+            r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\!|\?)\s+(?=[A-Z])'
+        )
         sentences = sentence_endings.split(text)
-        
-        # Clean sentences
+
+        # 清理句子
         sentences = [s.strip() for s in sentences if s.strip()]
-        
+        logger.debug(f"Split into {len(sentences)} sentences")
+
         chunks = []
         i = 0
-        
+
         while i < len(sentences):
             current_chunk = []
             current_size = 0
-            
-            # Build chunk starting from sentence i
+
+            # 从句子 i 开始构建当前块
             for j in range(i, len(sentences)):
                 sentence = sentences[j]
-                
-                # Calculate size with space
                 space_size = 1 if current_chunk else 0
                 total_addition = len(sentence) + space_size
-                
-                # Check if adding this sentence would exceed chunk size
+
+                # 检查是否超出块大小限制
                 if current_size + total_addition > self.chunk_size and current_chunk:
                     break
-                
+
                 current_chunk.append(sentence)
                 current_size += total_addition
-            
-            # Add chunk if we have content
+
+            # 添加文本块
             if current_chunk:
                 chunks.append(' '.join(current_chunk))
-                
-                # Calculate overlap for next chunk
-                if hasattr(self, 'chunk_overlap') and self.chunk_overlap > 0:
-                    # Find how many sentences to overlap
+
+                # 计算重叠区域
+                if self.chunk_overlap > 0:
                     overlap_size = 0
                     overlap_sentences = 0
-                    
-                    # Count backwards from end of current chunk
+
+                    # 从当前块末尾倒推重叠句子数
                     for k in range(len(current_chunk) - 1, -1, -1):
                         sentence_len = len(current_chunk[k]) + (1 if k < len(current_chunk) - 1 else 0)
                         if overlap_size + sentence_len <= self.chunk_overlap:
@@ -77,116 +146,125 @@ class DocumentProcessor:
                             overlap_sentences += 1
                         else:
                             break
-                    
-                    # Move start position considering overlap
+
+                    # 设置下一个块的起始位置
                     next_start = i + len(current_chunk) - overlap_sentences
-                    i = max(next_start, i + 1)  # Ensure we make progress
+                    i = max(next_start, i + 1)  # 确保进度推进
                 else:
-                    # No overlap - move to next sentence after current chunk
                     i += len(current_chunk)
             else:
-                # No sentences fit, move to next
                 i += 1
-        
+
+        logger.debug(f"Created {len(chunks)} chunks")
         return chunks
 
-
-
-
-    
     def process_course_document(self, file_path: str) -> Tuple[Course, List[CourseChunk]]:
         """
-        Process a course document with expected format:
-        Line 1: Course Title: [title]
-        Line 2: Course Link: [url]
-        Line 3: Course Instructor: [instructor]
-        Following lines: Lesson markers and content
+        处理课程文档
+
+        解析文档结构，提取课程元数据和课时内容，
+        生成分块后的课程片段。
+
+        Args:
+            file_path: 课程文档路径
+
+        Returns:
+            (Course 对象, CourseChunk 列表)
+
+        解析流程：
+        1. 读取文件内容
+        2. 提取课程标题、链接、讲师（前三行）
+        3. 识别课时标记（Lesson N: Title）
+        4. 对每个课时内容进行分块
+        5. 添加课程和课时上下文信息
         """
+        logger.debug(f"Processing course document: {file_path}")
         content = self.read_file(file_path)
         filename = os.path.basename(file_path)
-        
+
         lines = content.strip().split('\n')
-        
-        # Extract course metadata from first three lines
-        course_title = filename  # Default fallback
+
+        # 解析课程元数据
+        course_title = filename  # 默认使用文件名
         course_link = None
         instructor_name = "Unknown"
-        
-        # Parse course title from first line
+
+        # 从第一行解析课程标题
         if len(lines) >= 1 and lines[0].strip():
             title_match = re.match(r'^Course Title:\s*(.+)$', lines[0].strip(), re.IGNORECASE)
             if title_match:
                 course_title = title_match.group(1).strip()
             else:
                 course_title = lines[0].strip()
-        
-        # Parse remaining lines for course metadata
-        for i in range(1, min(len(lines), 4)):  # Check first 4 lines for metadata
+
+        # 解析课程链接和讲师（前四行）
+        for i in range(1, min(len(lines), 4)):
             line = lines[i].strip()
             if not line:
                 continue
-                
-            # Try to match course link
+
+            # 匹配课程链接
             link_match = re.match(r'^Course Link:\s*(.+)$', line, re.IGNORECASE)
             if link_match:
                 course_link = link_match.group(1).strip()
                 continue
-                
-            # Try to match instructor
+
+            # 匹配讲师姓名
             instructor_match = re.match(r'^Course Instructor:\s*(.+)$', line, re.IGNORECASE)
             if instructor_match:
                 instructor_name = instructor_match.group(1).strip()
                 continue
-        
-        # Create course object with title as ID
+
+        # 创建 Course 对象
         course = Course(
             title=course_title,
             course_link=course_link,
             instructor=instructor_name if instructor_name != "Unknown" else None
         )
-        
-        # Process lessons and create chunks
+        logger.debug(f"Created course: '{course_title}', instructor='{instructor_name}'")
+
+        # 处理课时内容
         course_chunks = []
         current_lesson = None
         lesson_title = None
         lesson_link = None
         lesson_content = []
         chunk_counter = 0
-        
-        # Start processing from line 4 (after metadata)
+
+        # 跳过元数据行，从第四行开始处理课时
         start_index = 3
         if len(lines) > 3 and not lines[3].strip():
-            start_index = 4  # Skip empty line after instructor
-        
+            start_index = 4  # 跳过空行
+
         i = start_index
         while i < len(lines):
             line = lines[i]
-            
-            # Check for lesson markers (e.g., "Lesson 0: Introduction")
+
+            # 匹配课时标记（如 "Lesson 1: Introduction"）
             lesson_match = re.match(r'^Lesson\s+(\d+):\s*(.+)$', line.strip(), re.IGNORECASE)
-            
+
             if lesson_match:
-                # Process previous lesson if it exists
+                # 处理上一个课时（如果存在）
                 if current_lesson is not None and lesson_content:
                     lesson_text = '\n'.join(lesson_content).strip()
                     if lesson_text:
-                        # Add lesson to course
+                        # 创建 Lesson 对象
                         lesson = Lesson(
                             lesson_number=current_lesson,
                             title=lesson_title,
                             lesson_link=lesson_link
                         )
                         course.lessons.append(lesson)
-                        
-                        # Create chunks for this lesson
+
+                        # 对课时内容分块
                         chunks = self.chunk_text(lesson_text)
                         for idx, chunk in enumerate(chunks):
-                            # For the first chunk of each lesson, add lesson context
+                            # 第一个块添加课时上下文
                             if idx == 0:
                                 chunk_with_context = f"Lesson {current_lesson} content: {chunk}"
                             else:
                                 chunk_with_context = chunk
-                            
+
                             course_chunk = CourseChunk(
                                 content=chunk_with_context,
                                 course_title=course.title,
@@ -195,28 +273,28 @@ class DocumentProcessor:
                             )
                             course_chunks.append(course_chunk)
                             chunk_counter += 1
-                
-                # Start new lesson
+
+                # 开始新课时
                 current_lesson = int(lesson_match.group(1))
                 lesson_title = lesson_match.group(2).strip()
                 lesson_link = None
-                
-                # Check if next line is a lesson link
+
+                # 检查下一行是否是课时链接
                 if i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
                     link_match = re.match(r'^Lesson Link:\s*(.+)$', next_line, re.IGNORECASE)
                     if link_match:
                         lesson_link = link_match.group(1).strip()
-                        i += 1  # Skip the link line so it's not added to content
-                
+                        i += 1  # 跳过链接行
+
                 lesson_content = []
             else:
-                # Add line to current lesson content
+                # 添加内容到当前课时
                 lesson_content.append(line)
-                
+
             i += 1
-        
-        # Process the last lesson
+
+        # 处理最后一个课时
         if current_lesson is not None and lesson_content:
             lesson_text = '\n'.join(lesson_content).strip()
             if lesson_text:
@@ -226,13 +304,12 @@ class DocumentProcessor:
                     lesson_link=lesson_link
                 )
                 course.lessons.append(lesson)
-                
+
                 chunks = self.chunk_text(lesson_text)
                 for idx, chunk in enumerate(chunks):
-                    # For any chunk of each lesson, add lesson context & course title
-                  
+                    # 所有块添加课程和课时上下文
                     chunk_with_context = f"Course {course_title} Lesson {current_lesson} content: {chunk}"
-                    
+
                     course_chunk = CourseChunk(
                         content=chunk_with_context,
                         course_title=course.title,
@@ -241,8 +318,8 @@ class DocumentProcessor:
                     )
                     course_chunks.append(course_chunk)
                     chunk_counter += 1
-        
-        # If no lessons found, treat entire content as one document
+
+        # 如果没有课时结构，将全部内容作为单个文档处理
         if not course_chunks and len(lines) > 2:
             remaining_content = '\n'.join(lines[start_index:]).strip()
             if remaining_content:
@@ -255,5 +332,6 @@ class DocumentProcessor:
                     )
                     course_chunks.append(course_chunk)
                     chunk_counter += 1
-        
+
+        logger.debug(f"Processed '{course.title}': {len(course.lessons)} lessons, {len(course_chunks)} chunks")
         return course, course_chunks
